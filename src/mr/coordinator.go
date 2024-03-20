@@ -293,7 +293,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.mapTasks = make(map[int]*TaskInfo)
 	var chunkFiles []string
 
-	chunkFiles, err := splitToChunks(files, -1) // -1 imples don't perform chunking.
+	chunkFiles, err := splitToChunks(files, -1) // -1 implies don't perform chunking.
 	if err != nil {
 		log.Fatalf("Failed to split files into chunks: %v", err)
 	}
