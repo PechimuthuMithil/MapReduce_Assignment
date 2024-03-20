@@ -1,30 +1,64 @@
 package mr
 
 import (
-	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/rpc"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 )
 
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
 type ByKey []KeyValue
+
+var idList sync.Map
+var workerID string
 
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-// Map functions return a slice of KeyValue.
-type KeyValue struct {
-	Key   string
-	Value string
+func readFile(filename string) (string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Printf("cannot open %v", filename)
+		return "", err
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Printf("cannot read %v", filename)
+		return "", err
+	}
+	file.Close()
+	return string(content), nil
+}
+
+func GetId() string {
+	const charset = "1234567890"
+	const length = 4
+	for {
+		seededRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+		b := make([]byte, length)
+		for i := range b {
+			b[i] = charset[seededRand.Intn(len(charset))]
+		}
+		id := "W-" + string(b)
+		_, loaded := idList.LoadOrStore(id, struct{}{})
+		if !loaded {
+			return id
+		}
+	}
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -35,289 +69,174 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// Returns a unique 64-bit int WorkerId
-func GetId() int {
-
-	x := rand.NewSource(time.Now().UnixNano())
-	y := rand.New(x)
-
-	return int(y.Intn(time.Now().Nanosecond()))
-}
-
-type MapFunction func(string, string) []KeyValue
-
-type ReduceFunction func(string, []string) string
-
-type WorkerTaskDetails struct {
-	Id int
-
-	TaskType int
-
-	MapFilename string
-
-	MapWorkerNum int
-
-	ReduceRegions int
-
-	ReduceWorkerNum int
-
-	MapWorkersList []int
-}
-
-type WorkerInfo struct {
-	Id int
-
-	MapF MapFunction
-
-	ReduceF ReduceFunction
-
-	Task *WorkerTaskDetails
-}
-
-// main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	rand.Seed(time.Now().UnixNano())
+	workerID = GetId()
 
-	w := WorkerInfo{}
-	w.Id = GetId()
-	w.MapF = mapf
-	w.ReduceF = reducef
-	w.Task = new(WorkerTaskDetails)
+	log.Printf("Initializing workerID: %s", workerID)
 
-	isRunning := true
-	for isRunning {
-		status := w.CallRequestTask()
-		var taskSucceeded bool = false
-		if status == TaskAssigned {
-			err := w.PerformTask()
-			if err == nil {
-				taskSucceeded = true
-			}
-			status = w.CallTaskComplete(taskSucceeded)
+	for {
+		task, err := GetTask()
+		if err != nil {
+			log.Println("Couldn't connect to Coordinator,quitting")
+			break
 		}
-
-		switch status {
-		case MoreTasks:
-			continue
-		case WaitForMoreTasks:
-			time.Sleep(time.Second)
-		case StaleTaskCompletion:
-			if w.Task.TaskType == Map {
-				// delete map files
+		if tasksAssigned(task) {
+			if task.Type == MAP {
+				doMap(mapf, task)
+			} else if task.Type == REDUCE {
+				doReduce(reducef, task)
 			} else {
-				// delete reduce output file
+				log.Printf("Unknown task assigned to workerID %s\n", workerID)
 			}
-		case SafelyExit:
-			isRunning = false
 		}
+		time.Sleep(2 * time.Second)
 	}
+
 }
 
-func (w *WorkerInfo) PerformTask() error {
+func doMap(mapf func(string, string) []KeyValue, task *TaskResponse) {
+	taskID := task.TaskID
+	if len(task.Filenames) < 1 {
+		log.Printf("No files provided to map worker. Invalid task: %v\n", task)
+		return
+	}
+
+	intermediatekeyValues := []KeyValue{}
+	LocalFileNames := []string{}
+	encoders := make(map[int]*json.Encoder)
+
+	for _, filename := range task.Filenames {
+		content, err := readFile(filename)
+		if err != nil {
+			log.Fatalf("Couldn't read from %s\n", filename)
+		}
+
+		// Append key values from each file to intermediatekeyValues
+		intermediatekeyValues = append(intermediatekeyValues, mapf(filename, content)...)
+	}
+
+	for i := 0; i < task.NReduce; i++ {
+		tmpFile, err := ioutil.TempFile("", "map")
+		if err != nil {
+			log.Fatal("Couldn't create temp file\n")
+		}
+		LocalFileNames = append(LocalFileNames, tmpFile.Name())
+		enc := json.NewEncoder(tmpFile)
+		encoders[i] = enc
+	}
+
+	for _, kv := range intermediatekeyValues {
+		err := encoders[ihash(kv.Key)%task.NReduce].Encode(&kv)
+		if err != nil {
+			log.Fatalf("Couldn't encode %v\n", &kv)
+		}
+	}
+
+	for i := 0; i < task.NReduce; i++ {
+		mapOutputFileName := fmt.Sprintf("mr-%d-%d.txt", taskID, i)
+		os.Rename(LocalFileNames[i], mapOutputFileName)
+		LocalFileNames[i] = mapOutputFileName
+	}
+	TaskDone(LocalFileNames, taskID, MAP)
+}
+
+func doReduce(reducef func(string, []string) string, task *TaskResponse) {
+	filenames := task.Filenames
 	intermediate := []KeyValue{}
-	task := w.Task
-	if task.TaskType == Map {
-		file, err := os.Open(task.MapFilename)
+	for _, filename := range filenames {
+		fileToReduce, err := os.Open(filename)
 		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		content, err := io.ReadAll(file)
-		if err != nil {
-			return err
+			log.Fatalf("Couldn't open file %s to reduce\n", filename)
 		}
 
-		kva := w.MapF(task.MapFilename, string(content))
-		intermediate = append(intermediate, kva...)
-
-		// sort.Sort(ByKey(intermediate))
-
-		reduce_regionkva := make([][]KeyValue, task.ReduceRegions)
-
-		for _, item := range intermediate {
-
-			partitionKey := ihash(item.Key) % task.ReduceRegions
-			reduce_regionkva[partitionKey] =
-				append(reduce_regionkva[partitionKey], item)
-		}
-
-		for i := 0; i < task.ReduceRegions; i++ {
-			opFilename :=
-				"mr-" + strconv.Itoa(task.MapWorkerNum) + "-" + strconv.Itoa(i)
-			opFile, err := os.Create(opFilename)
-			if err != nil {
-				return err
+		dec := json.NewDecoder(fileToReduce)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
 			}
-			for _, item := range reduce_regionkva[i] {
-				fmt.Fprintf(opFile, "%v %v\n", item.Key, item.Value)
-			}
-			opFile.Close()
+			intermediate = append(intermediate, kv)
 		}
-	} else {
-		keyTotal := []KeyValue{}
-		for _, fileNo := range task.MapWorkersList {
-			ipFileName :=
-				"mr-" + strconv.Itoa(fileNo) + "-" + strconv.Itoa(task.ReduceWorkerNum)
-			ipFile, err := os.Open(ipFileName)
-			if err != nil {
-				return err
-			}
-			sc := bufio.NewScanner(ipFile)
-			sc.Split(bufio.ScanLines)
-
-			for sc.Scan() {
-				line := sc.Text()
-				splitLine := strings.Split(line, " ")
-				key := splitLine[0]
-				count := splitLine[1]
-
-				kv := KeyValue{key, count}
-				keyTotal = append(keyTotal, kv)
-
-			}
-
-			ipFile.Close()
-		}
-
-		sort.Sort(ByKey(keyTotal))
-
-		opFileName := "mr-out-" + strconv.Itoa(task.ReduceWorkerNum)
-		opFile, err := os.Create(opFileName)
-
-		if err != nil {
-			// log.Printf("Cannot create filename %v for Reduce operation. Error: %v", opFileName, err)
-
-			return err
-		}
-
-		i := 0
-
-		for i < len(keyTotal) {
-
-			j := i + 1
-
-			for j < len(keyTotal) &&
-				keyTotal[j].Key == keyTotal[i].Key {
-
-				j++
-			}
-
-			values := []string{}
-
-			for k := i; k < j; k++ {
-
-				values = append(values, keyTotal[k].Value)
-			}
-
-			output := w.ReduceF(keyTotal[i].Key, values)
-
-			fmt.Fprintf(opFile, "%v %v\n", keyTotal[i].Key, output)
-
-			i = j
-		}
-		//		log.Printf ("\n\nClosing file: %s\n\n", opFileName)
-		opFile.Close()
-	} // end of reduce
-
-	return nil
-}
-
-func (w *WorkerInfo) CallTaskComplete(taskSucceeded bool) int {
-
-	// log.Printf(trace())
-
-	args := TaskCompleteArgs{}
-
-	reply := TaskCompleteReply{}
-
-	args.MapFilename = w.Task.MapFilename
-	args.TaskId = w.Task.Id
-	args.TaskSucceeded = taskSucceeded
-	args.TaskType = w.Task.TaskType
-	args.ReduceWorkerNum = w.Task.ReduceWorkerNum
-
-	ok := call("Coordinator.TaskComplete", &args, &reply)
-
-	if ok {
-		// log.Printf("Task completion informed succesfully\n")
-		return reply.ReplyStatus
-	} else {
-		// log.Printf("Call failed. Exiting...!\n")
-		return SafelyExit
-	}
-}
-
-func (w *WorkerInfo) CallRequestTask() int {
-
-	// log.Printf(trace())
-
-	var taskStatus int
-
-	// declare an argument structure.
-	args := AssignTaskArgs{}
-
-	// fill in the argument(s).
-	args.WorkerId = w.Id
-
-	// declare a reply structure.
-	reply := AssignTaskReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.AssignTask" tells the
-	// receiving server that we'd like to call
-	// the AssignTask() method of struct Coordinator.
-	ok := call("Coordinator.AssignTask", &args, &reply)
-
-	if ok {
-		// perform the task assigned
-		// log.Printf("Task Details %v\n", reply)
-		task := w.Task
-		task.Id = reply.TaskId
-		task.TaskType = reply.TaskType
-
-		switch {
-		case task.TaskType == Map:
-			task.MapFilename = reply.MapFileName
-			task.ReduceRegions = reply.ReduceBuckets
-			task.MapWorkerNum = reply.MapWorkerNum
-		case task.TaskType == Reduce:
-			task.ReduceWorkerNum = reply.ReduceWorkerNum
-			task.MapWorkersList = reply.CompletedMapWorkers
-		}
-
-		taskStatus = reply.ReplyStatus
-
-	} else {
-		// log.Printf("Call failed. Exiting...!\n")
-		taskStatus = SafelyExit
-
 	}
 
-	return taskStatus
+	sort.Sort(ByKey(intermediate))
+	oname := fmt.Sprintf("mr-out-%d", task.TaskID)
+
+	tmpFile, _ := ioutil.TempFile("", "pre-")
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+	tmpFile.Close()
+
+	os.Rename(tmpFile.Name(), oname)
+
+	TaskDone([]string{oname}, task.TaskID, REDUCE)
 }
 
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
+func GetTask() (*TaskResponse, error) {
+	taskRequest := TaskRequest{}
+	taskRequest.WorkerID = workerID
+	taskResponse := TaskResponse{}
+	if call("Coordinator.AssignTask", &taskRequest, &taskResponse) {
+		return &taskResponse, nil
+	} else {
+		return nil, errors.New("Couldn't connect to Coordinator")
+	}
+
+}
+
+func TaskDone(filenames []string, taskID int, taskType TaskType) {
+	taskDoneNotification := TaskDoneNotification{}
+	taskDoneNotification.WorkerID = workerID
+	taskDoneNotification.Filenames = filenames
+	taskDoneNotification.TaskID = taskID
+	taskDoneNotification.Type = taskType
+
+	taskDoneAck := TaskDoneAck{}
+
+	if call("Coordinator.TaskDone", &taskDoneNotification, &taskDoneAck) {
+		if !taskDoneAck.Ack {
+			log.Panicf("Coordinator didnt ack")
+		}
+	} else {
+		log.Panicf("Couldn't notify Coordinator")
+	}
+
+}
+
 func call(rpcname string, args interface{}, reply interface{}) bool {
-
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
+	sockname := CoordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
-
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
-
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-
 	if err == nil {
 		return true
 	}
 
 	fmt.Println(err)
 	return false
+}
+
+func tasksAssigned(task *TaskResponse) bool {
+	return len(task.Filenames) > 0
 }

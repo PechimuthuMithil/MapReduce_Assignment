@@ -11,45 +11,37 @@ import (
 	"strconv"
 )
 
+type TaskType string
+
 const (
-	Map                 = 0
-	Reduce              = 1
-	SafelyExit          = -1
-	MoreTasks           = 0
-	WaitForMoreTasks    = 1
-	TaskAssigned        = 2
-	StaleTaskCompletion = 3
+	MAP    TaskType = "MAP"
+	REDUCE TaskType = "REDUCE"
 )
 
-type AssignTaskArgs struct {
-	WorkerId int
+type TaskRequest struct {
+	WorkerID string
 }
 
-type AssignTaskReply struct {
-	ReplyStatus         int
-	TaskId              int
-	TaskType            int
-	MapWorkerNum        int
-	MapFileName         string
-	ReduceWorkerNum     int
-	ReduceBuckets       int
-	CompletedMapWorkers []int
+type TaskDoneNotification struct {
+	WorkerID  string
+	Filenames []string
+	TaskID    int
+	Type      TaskType
 }
 
-type TaskCompleteArgs struct {
-	TaskType        int
-	MapFilename     string
-	ReduceWorkerNum int
-	TaskId          int
-	TaskSucceeded   bool
+type TaskDoneAck struct {
+	Ack bool
 }
 
-type TaskCompleteReply struct {
-	ReplyStatus int
+type TaskResponse struct {
+	TaskID    int
+	Type      TaskType
+	Filenames []string
+	NReduce   int
 }
 
-func coordinatorSock() string {
-	s := "/var/tmp/824-mr-"
+func CoordinatorSock() string {
+	s := "/var/tmp/cs612-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
